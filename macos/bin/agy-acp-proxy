@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# ============================================================================
+# agy-acp-proxy (macOS) —— 让外部编辑器 ACP / CLI 走 Antigravity-Proxy 本地微中继
+#
+# 用法：
+#   agy-acp-proxy <目标程序> [参数...]
+#   示例：
+#     agy-acp-proxy ~/.local/bin/agy acp
+#     agy-acp-proxy ~/Library/.../agy_acp_server
+#
+# 约束：
+#   - 绝不向 stdout 写任何内容（stdout 属于 ACP JSON-RPC 通道），诊断信息仅写 stderr；
+#   - 不修改目标二进制签名（兼容 Apple Hardened Runtime），通过本地微中继提供：
+#     * 上游 SOCKS5/HTTP 账密认证转发
+#     * config.json 路由规则与局域网直连
+#     * proxy-YYYYMMDD.log 实时流量日志
+# ============================================================================
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+  echo "[agy-acp-proxy] 用法: agy-acp-proxy <目标程序> [参数...]" >&2
+  exit 2
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AGP_HOME="${AGP_HOME:-$HOME/.antigravity-proxy}"
+CONFIG_PATH="${AGP_CONFIG_PATH:-$AGP_HOME/config.json}"
+STATE_FILE="${AGP_RELAY_STATE:-$AGP_HOME/relay.json}"
+
+# 定位 agp-relay.js（优先同仓库/安装目录，其次 ~/.antigravity-proxy/relay）
+RELAY_SCRIPT=""
+for candidate in \
+  "$SCRIPT_DIR/../relay/agp-relay.js" \
+  "$AGP_HOME/relay/agp-relay.js"; do
+  if [[ -f "$candidate" ]]; then
+    RELAY_SCRIPT="$candidate"
+    break
+  fi
+done
+
+# 在 GUI 编辑器（Zed / JetBrains）拉起的精简 PATH 中补充常见 Node 路径
+find_node() {
+  if [[ -n "${AGP_NODE_BIN:-}" && -x "${AGP_NODE_BIN}" ]]; then
+    echo "$AGP_NODE_BIN"
+    return 0
+  fi
+  if command -v node >/dev/null 2>&1; then
+    command -v node
+    return 0
+  fi
+  for candidate in \
+    /opt/homebrew/bin/node \
+    /usr/local/bin/node \
+    "$HOME/.volta/bin/node" \
+    "$HOME/.asdf/shims/node" \
+    "$HOME/.local/share/fnm/aliases/default/bin/node"; do
+    if [[ -x "$candidate" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  # 检查 nvm 常见版本目录
+  if [[ -d "$HOME/.nvm/versions/node" ]]; then
+    local latest
+    latest="$(ls -1d "$HOME/.nvm/versions/node/"*/bin/node 2>/dev/null | sort -V | tail -n 1 || true)"
+    if [[ -n "$latest" && -x "$latest" ]]; then
+      echo "$latest"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+RELAY_URL=""
+if [[ -n "$RELAY_SCRIPT" ]]; then
+  NODE_BIN="$(find_node || true)"
+  if [[ -n "$NODE_BIN" ]]; then
+    if ! RELAY_URL="$("$NODE_BIN" "$RELAY_SCRIPT" --ensure --config "$CONFIG_PATH" --state-file "$STATE_FILE")"; then
+      echo "[agy-acp-proxy] 警告: 本地代理中继启动失败，将以直连模式继续启动目标程序" >&2
+      RELAY_URL=""
+    fi
+  else
+    echo "[agy-acp-proxy] 警告: 未找到 Node.js，无法启动本地代理中继" >&2
+  fi
+fi
+
+if [[ -n "$RELAY_URL" ]]; then
+  NO_PROXY_VAL="localhost,127.0.0.1,::1,.local"
+  export HTTP_PROXY="$RELAY_URL"
+  export HTTPS_PROXY="$RELAY_URL"
+  export ALL_PROXY="$RELAY_URL"
+  export http_proxy="$RELAY_URL"
+  export https_proxy="$RELAY_URL"
+  export all_proxy="$RELAY_URL"
+  export NO_PROXY="$NO_PROXY_VAL"
+  export no_proxy="$NO_PROXY_VAL"
+  export AGP_MACOS_RELAY_URL="$RELAY_URL"
+  export AGP_CONFIG_PATH="$CONFIG_PATH"
+fi
+
+exec "$@"

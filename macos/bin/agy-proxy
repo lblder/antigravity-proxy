@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# ============================================================================
+# agy-proxy (macOS) —— 通过 Antigravity-Proxy 本地微中继运行 Antigravity CLI (agy)
+# 用法：agy-proxy [agy 参数...]，例如：agy-proxy models / agy-proxy -p "hello"
+# ============================================================================
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WRAPPER="$SCRIPT_DIR/agy-acp-proxy"
+
+find_agy() {
+  if [[ -n "${AGP_AGY_BIN:-}" && -x "${AGP_AGY_BIN}" ]]; then
+    echo "$AGP_AGY_BIN"
+    return 0
+  fi
+  for candidate in \
+    "$HOME/.gemini/bin/agy" \
+    "$HOME/.local/bin/agy" \
+    /opt/homebrew/bin/agy \
+    /usr/local/bin/agy; do
+    if [[ -x "$candidate" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  if command -v agy >/dev/null 2>&1; then
+    command -v agy
+    return 0
+  fi
+  return 1
+}
+
+AGY_BIN="$(find_agy || true)"
+if [[ -z "$AGY_BIN" ]]; then
+  echo "[agy-proxy] 未找到 agy 可执行文件，请检查安装或设置 AGP_AGY_BIN" >&2
+  exit 127
+fi
+
+exec "$WRAPPER" "$AGY_BIN" "$@"
