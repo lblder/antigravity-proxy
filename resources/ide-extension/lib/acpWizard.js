@@ -90,7 +90,7 @@ async function pickTarget(deps) {
     const picked = await vscode.window.showOpenDialog({
       title: t("acp.browseTitle"),
       canSelectMany: false,
-      filters: { exe: ["exe"] },
+      ...(process.platform === "win32" ? { filters: { exe: ["exe"] } } : {}),
     });
     if (!picked || picked.length === 0) return undefined;
     const exePath = picked[0].fsPath;

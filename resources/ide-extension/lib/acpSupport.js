@@ -18,15 +18,30 @@ const os = require("os");
 const path = require("path");
 const Core = require("./core");
 
-/** 包装器文件名（与 CMake 目标 / 发布包一致） */
+/** 包装器文件名（Windows 为 agy-acp-proxy.exe；macOS 为 agy-acp-proxy） */
 const ACP_WRAPPER_NAME = "agy-acp-proxy.exe";
-/** ACP Registry 版服务端（antigravity-acp/agent.json 中 windows 的 cmd） */
+const ACP_WRAPPER_NAME_MACOS = "agy-acp-proxy";
+/** ACP Registry 版服务端 */
 const ACP_SERVER_EXE = "agy_acp_server.exe";
+const ACP_SERVER_EXES = Object.freeze(["agy_acp_server.exe", "agy_acp_server"]);
 /** 写入各编辑器的 Agent 名称（与官方 “Antigravity” 区分，避免覆盖用户已有条目） */
 const ACP_AGENT_NAME = "Antigravity (Proxy)";
 
 /** 识别“未经包装器的 Antigravity Agent”所用的可执行文件名 */
 const ANTIGRAVITY_AGENT_EXES = Object.freeze(["agy", "agy.exe", "agy_acp_server", ACP_SERVER_EXE]);
+/** 识别“已走包装器”的可执行文件名 */
+const ACP_WRAPPER_NAMES = Object.freeze([ACP_WRAPPER_NAME, ACP_WRAPPER_NAME_MACOS]);
+
+/** 按平台返回包装器文件名 */
+function wrapperNameForPlatform(platform = process.platform) {
+  return platform === "win32" ? ACP_WRAPPER_NAME : ACP_WRAPPER_NAME_MACOS;
+}
+
+/** 跨平台取路径最后一段文件名（兼容在 macOS/Linux 上解析 Windows 路径） */
+function baseNameAny(filePath) {
+  const parts = String(filePath || "").split(/[\\/]+/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : "";
+}
 
 /** 扫描 Registry 安装目录时跳过的大目录（只影响速度，不影响正确性） */
 const SKIP_DIR_NAMES = new Set(["node_modules", ".git", "index", "jcef_cache", "log", "logs"]);
@@ -63,6 +78,7 @@ function findAgyCandidates(opts = {}) {
   const env = opts.env || process.env;
   const homeDir = opts.homeDir || os.homedir();
   const fsImpl = opts.fsImpl || fs;
+  const platform = opts.platform || process.platform;
   const localAppData = env.LOCALAPPDATA || path.join(homeDir, "AppData", "Local");
 
   /** @type {AcpTarget[]} */
@@ -77,7 +93,15 @@ function findAgyCandidates(opts = {}) {
   };
 
   const ideBin = path.join(homeDir, ".gemini", "bin");
-  add(path.join(ideBin, "agy.exe"), "ide", readIdeAgyVersion(ideBin, fsImpl));
+  const ideVersion = readIdeAgyVersion(ideBin, fsImpl);
+  if (platform === "darwin") {
+    add(path.join(ideBin, "agy"), "ide", ideVersion);
+    add(path.join(homeDir, ".local", "bin", "agy"), "cli");
+    add("/opt/homebrew/bin/agy", "cli");
+    add("/usr/local/bin/agy", "cli");
+  }
+  // 保留 Windows 路径探测（兼容跨平台单元测试）
+  add(path.join(ideBin, "agy.exe"), "ide", ideVersion);
   add(path.join(localAppData, "agy", "bin", "agy.exe"), "cli");
   add(path.join(localAppData, "Programs", "Antigravity CLI", "agy.exe"), "cli");
   return result;
@@ -107,19 +131,31 @@ function defaultRegistryRoots(opts = {}) {
   const env = opts.env || process.env;
   const homeDir = opts.homeDir || os.homedir();
   const fsImpl = opts.fsImpl || fs;
+  const platform = opts.platform || process.platform;
   const localAppData = env.LOCALAPPDATA || path.join(homeDir, "AppData", "Local");
   const appData = env.APPDATA || path.join(homeDir, "AppData", "Roaming");
 
-  const roots = [
-    path.join(localAppData, "JetBrains"),
-    path.join(appData, "JetBrains"),
-    path.join(homeDir, ".jetbrains"),
-    path.join(localAppData, "Zed"),
-    path.join(appData, "Zed"),
-    path.join(appData, "app.codeg"),
-  ];
-  // Android Studio 的目录形如 %LOCALAPPDATA%\Google\AndroidStudio2025.2（只取这一类，避免扫描 Chrome 数据）
-  for (const googleDir of [path.join(localAppData, "Google"), path.join(appData, "Google")]) {
+  const roots = platform === "darwin"
+    ? [
+      path.join(homeDir, "Library", "Application Support", "JetBrains"),
+      path.join(homeDir, "Library", "Caches", "JetBrains"),
+      path.join(homeDir, ".jetbrains"),
+      path.join(homeDir, "Library", "Application Support", "Zed"),
+      path.join(homeDir, "Library", "Application Support", "app.codeg"),
+    ]
+    : [
+      path.join(localAppData, "JetBrains"),
+      path.join(appData, "JetBrains"),
+      path.join(homeDir, ".jetbrains"),
+      path.join(localAppData, "Zed"),
+      path.join(appData, "Zed"),
+      path.join(appData, "app.codeg"),
+    ];
+  // Android Studio 的目录形如 %LOCALAPPDATA%\Google\AndroidStudio2025.2 或 ~/Library/Application Support/Google/AndroidStudio*
+  const googleDirs = platform === "darwin"
+    ? [path.join(homeDir, "Library", "Application Support", "Google"), path.join(homeDir, "Library", "Caches", "Google")]
+    : [path.join(localAppData, "Google"), path.join(appData, "Google")];
+  for (const googleDir of googleDirs) {
     try {
       for (const name of fsImpl.readdirSync(googleDir)) {
         if (/^androidstudio/i.test(name)) roots.push(path.join(googleDir, name));
@@ -161,7 +197,7 @@ async function findRegistryServers(opts) {
       continue;
     }
     for (const entry of entries) {
-      if (entry.isFile() && entry.name.toLowerCase() === ACP_SERVER_EXE) {
+      if (entry.isFile() && ACP_SERVER_EXES.includes(entry.name.toLowerCase())) {
         const exePath = path.join(dir, entry.name);
         const version = guessVersionFromPath(exePath);
         found.push({ kind: "registry", path: exePath, source: "registry", ...(version ? { version } : {}) });
@@ -180,8 +216,9 @@ async function findRegistryServers(opts) {
  * @returns {string | undefined}
  */
 function guessVersionFromPath(exePath) {
-  const parts = path.dirname(exePath).split(/[\\/]+/).reverse();
-  const hit = parts.find((p) => /^v?\d+\.\d+\.\d+([-.][0-9A-Za-z.-]+)?$/.test(p));
+  const segments = String(exePath || "").split(/[\\/]+/).filter(Boolean);
+  const dirs = segments.slice(0, -1).reverse();
+  const hit = dirs.find((p) => /^v?\d+\.\d+\.\d+([-.][0-9A-Za-z.-]+)?$/.test(p));
   return hit ? hit.replace(/^v/, "") : undefined;
 }
 
@@ -197,13 +234,13 @@ function compareVersionDesc(a, b) {
 }
 
 /**
- * 包装器命令：`agy acp` 需要追加子命令参数，Registry 版直接启动即可（Windows 无额外参数）。
+ * 包装器命令：`agy acp` 需要追加子命令参数，Registry 版直接启动即可。
  * @param {string} wrapperPath
  * @param {AcpTarget} target
  * @returns {{ command: string, args: string[] }}
  */
 function buildAgentCommand(wrapperPath, target) {
-  const isAgy = target.kind === "agy" || /^agy(\.exe)?$/i.test(path.basename(target.path));
+  const isAgy = target.kind === "agy" || /^agy(\.exe)?$/i.test(baseNameAny(target.path));
   return { command: wrapperPath, args: isAgy ? [target.path, "acp"] : [target.path] };
 }
 
@@ -282,8 +319,8 @@ function analyzeAgentServers(text) {
   if (!servers || typeof servers !== "object") return result;
   for (const value of Object.values(servers)) {
     const command = typeof value?.command === "string" ? value.command : "";
-    const base = path.win32.basename(command).toLowerCase();
-    if (base === ACP_WRAPPER_NAME) result.proxied = true;
+    const base = baseNameAny(command).toLowerCase();
+    if (ACP_WRAPPER_NAMES.includes(base)) result.proxied = true;
     else if (ANTIGRAVITY_AGENT_EXES.includes(base)) result.unwrapped = true;
   }
   return result;
@@ -294,15 +331,20 @@ function jetBrainsAcpJsonPath(homeDir = os.homedir()) {
   return path.join(homeDir, ".jetbrains", "acp.json");
 }
 
-/** @param {NodeJS.ProcessEnv} [env] @param {string} [homeDir] */
-function zedSettingsPath(env = process.env, homeDir = os.homedir()) {
+/** @param {NodeJS.ProcessEnv} [env] @param {string} [homeDir] @param {NodeJS.Platform} [platform] */
+function zedSettingsPath(env = process.env, homeDir = os.homedir(), platform = process.platform) {
+  if (platform === "darwin") {
+    return path.join(homeDir, ".config", "zed", "settings.json");
+  }
   return path.join(env.APPDATA || path.join(homeDir, "AppData", "Roaming"), "Zed", "settings.json");
 }
 
 module.exports = {
   ACP_WRAPPER_NAME,
+  ACP_WRAPPER_NAME_MACOS,
   ACP_SERVER_EXE,
   ACP_AGENT_NAME,
+  wrapperNameForPlatform,
   findAgyCandidates,
   defaultRegistryRoots,
   findRegistryServers,

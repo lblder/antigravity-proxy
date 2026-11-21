@@ -122,7 +122,7 @@ function activate(context) {
       proxy,
       reach: proxy && proxy.port > 0 ? lastReach : null,
       pendingRestart: isPendingRestart(),
-      missingTargets: read.status === "ok" ? findMissingTargets(read.raw) : [],
+      missingTargets: info.mode === "win-dll" && read.status === "ok" ? findMissingTargets(read.raw) : [],
       egress: ipInfo.state,
       gemini: geminiState,
       update: updater.getState(),

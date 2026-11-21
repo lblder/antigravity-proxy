@@ -68,6 +68,51 @@ function parseWindowsProxyServer(value) {
 }
 
 /**
+ * 解析 macOS `scutil --proxy` 输出，提取已启用的 SOCKS / HTTPS / HTTP 代理端点。
+ * @param {string | undefined | null} stdout
+ * @returns {Endpoint[]}
+ */
+function parseMacosScutilProxy(stdout) {
+  const s = String(stdout ?? "");
+  if (!s.trim()) return [];
+  /** @type {Record<string, string>} */
+  const map = {};
+  for (const line of s.split(/\r?\n/)) {
+    const m = /^\s*([A-Za-z0-9_]+)\s*:\s*(.+?)\s*$/.exec(line);
+    if (m) map[m[1]] = m[2];
+  }
+  /** @type {Endpoint[]} */
+  const out = [];
+  /** @param {string} enableKey @param {string} hostKey @param {string} portKey @param {"socks5" | "http"} hint */
+  const collect = (enableKey, hostKey, portKey, hint) => {
+    if (map[enableKey] !== "1") return;
+    const host = (map[hostKey] || "").trim();
+    const port = Number(map[portKey]);
+    if (host && Number.isInteger(port) && port > 0 && port <= 65535) {
+      out.push({ host, port, hint });
+    }
+  };
+  collect("SOCKSEnable", "SOCKSProxy", "SOCKSPort", "socks5");
+  collect("HTTPSEnable", "HTTPSProxy", "HTTPSPort", "http");
+  collect("HTTPEnable", "HTTPProxy", "HTTPPort", "http");
+  return out;
+}
+
+/**
+ * 读取 macOS 当前系统代理（通过 scutil --proxy）。
+ * @returns {Promise<Endpoint[]>}
+ */
+function readMacosSystemProxy() {
+  if (process.platform !== "darwin") return Promise.resolve([]);
+  return new Promise((resolve) => {
+    execFile("scutil", ["--proxy"], { timeout: 3000 }, (err, stdout) => {
+      if (err || !stdout) return resolve([]);
+      resolve(parseMacosScutilProxy(stdout));
+    });
+  });
+}
+
+/**
  * 读取 Windows 当前用户的系统代理（仅在 ProxyEnable=1 时返回 ProxyServer）。
  * @returns {Promise<string | null>}
  */
@@ -101,6 +146,7 @@ function readWindowsSystemProxy() {
 async function scanLocalProxies(opts = {}) {
   const env = opts.env ?? process.env;
   const systemProxy = opts.systemProxy !== undefined ? opts.systemProxy : await readWindowsSystemProxy();
+  const macosEndpoints = opts.systemProxy !== undefined ? [] : await readMacosSystemProxy();
 
   /** @type {Map<string, { host: string, port: number, sources: Set<ScanSource> }>} */
   const endpoints = new Map();
@@ -116,6 +162,7 @@ async function scanLocalProxies(opts = {}) {
   if (current) add({ host: current.host, port: current.port }, "current");
   add(parseProxyUrl(opts.ideProxy), "ide");
   for (const ep of parseWindowsProxyServer(systemProxy)) add(ep, "system");
+  for (const ep of macosEndpoints) add(ep, "system");
   for (const k of ENV_KEYS) add(parseProxyUrl(env[k]), "env");
   for (const p of opts.ports ?? COMMON_PORTS) add({ host: "127.0.0.1", port: p }, "port");
 
@@ -151,4 +198,12 @@ async function scanLocalProxies(opts = {}) {
   return { candidates, scanned: endpoints.size };
 }
 
-module.exports = { scanLocalProxies, parseProxyUrl, parseWindowsProxyServer, readWindowsSystemProxy, COMMON_PORTS };
+module.exports = {
+  scanLocalProxies,
+  parseProxyUrl,
+  parseWindowsProxyServer,
+  parseMacosScutilProxy,
+  readWindowsSystemProxy,
+  readMacosSystemProxy,
+  COMMON_PORTS,
+};

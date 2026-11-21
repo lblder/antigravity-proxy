@@ -15,8 +15,9 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
-const { isDllLoadedInThisProcess, statOrNull } = require("./installInfo");
-const { ACP_WRAPPER_NAME } = require("./acpSupport");
+const Core = require("./core");
+const { isDllLoadedInThisProcess, isMacosRelayActive, statOrNull } = require("./installInfo");
+const { ACP_WRAPPER_NAME, ACP_WRAPPER_NAME_MACOS } = require("./acpSupport");
 const I18n = require("../media/i18n");
 
 // 未传入翻译函数时使用简体中文
@@ -45,12 +46,20 @@ class PatchGuard {
     this.t = t;
     this.info = info;
     this.store = store;
+    this.isMacos = info.mode === "macos-relay";
     this.payloadDir = path.join(extensionPath, "payload");
-    this.payloadDll = path.join(this.payloadDir, "version.dll");
+    this.payloadDll = this.isMacos
+      ? path.join(this.payloadDir, "macos", "relay", "agp-relay.js")
+      : path.join(this.payloadDir, "version.dll");
     this.payloadConfig = path.join(this.payloadDir, "config.json");
-    // ACP 启动包装器（Issue #164）：部署在 IDE 安装目录，与 version.dll / config.json 共用同一份代理配置
-    this.payloadAcpWrapper = path.join(this.payloadDir, ACP_WRAPPER_NAME);
-    this.acpWrapperPath = path.join(info.installDir, ACP_WRAPPER_NAME);
+    // ACP 启动包装器（Issue #164）：Windows 在安装目录；macOS 在 ~/.antigravity-proxy/bin/agy-acp-proxy
+    this.acpWrapperName = this.isMacos ? ACP_WRAPPER_NAME_MACOS : ACP_WRAPPER_NAME;
+    this.payloadAcpWrapper = this.isMacos
+      ? path.join(this.payloadDir, "macos", "bin", ACP_WRAPPER_NAME_MACOS)
+      : path.join(this.payloadDir, ACP_WRAPPER_NAME);
+    this.acpWrapperPath = this.isMacos
+      ? path.join(info.installDir, "bin", ACP_WRAPPER_NAME_MACOS)
+      : path.join(info.installDir, ACP_WRAPPER_NAME);
     this.shouldRestoreAcpWrapper = options.shouldRestoreAcpWrapper || (() => false);
   }
 
@@ -61,22 +70,29 @@ class PatchGuard {
   checkAcpWrapper() {
     const payloadAvailable = !!statOrNull(this.payloadAcpWrapper);
     const deployed = !!statOrNull(this.acpWrapperPath);
-    const upToDate = payloadAvailable && deployed &&
-      sha256OrUndefined(this.payloadAcpWrapper) === sha256OrUndefined(this.acpWrapperPath);
+    const upToDate = deployed && (!payloadAvailable ||
+      sha256OrUndefined(this.payloadAcpWrapper) === sha256OrUndefined(this.acpWrapperPath));
     return { payloadAvailable, deployed, upToDate, path: this.acpWrapperPath };
   }
 
   /**
-   * 部署/更新 ACP 包装器到 IDE 安装目录（内容一致时不重复写入）。
-   * 正在被编辑器使用的旧包装器无法覆盖（EBUSY/EPERM），此时返回错误由调用方提示稍后重试。
+   * 部署/更新 ACP 包装器（内容一致时不重复写入）。
    * @returns {{ ok: true, changed: boolean, path: string } | { ok: false, error: string }}
    */
   deployAcpWrapper() {
     const s = this.checkAcpWrapper();
+    // macOS 若通过 install-macos.sh 已部署包装器，即使插件未携带内置 payload 也可直接使用
+    if (this.isMacos && s.deployed && !s.payloadAvailable) {
+      return { ok: true, changed: false, path: s.path };
+    }
     if (!s.payloadAvailable) return { ok: false, error: this.t("acp.noPayload") };
     if (s.upToDate) return { ok: true, changed: false, path: s.path };
     try {
+      fs.mkdirSync(path.dirname(this.acpWrapperPath), { recursive: true });
       atomicCopy(this.payloadAcpWrapper, this.acpWrapperPath, this.t);
+      if (this.isMacos) {
+        try { fs.chmodSync(this.acpWrapperPath, 0o755); } catch { /* ignore */ }
+      }
       return { ok: true, changed: true, path: s.path };
     } catch (e) {
       const err = /** @type {NodeJS.ErrnoException} */ (e);
@@ -89,6 +105,18 @@ class PatchGuard {
 
   /** @returns {PatchStatus} */
   check() {
+    if (this.isMacos) {
+      const relayExists = !!statOrNull(this.info.dllPath);
+      const relayActive = isMacosRelayActive(process.env, this.info.relayStatePath || "");
+      return {
+        dllExists: relayExists,
+        dllLoaded: relayExists ? relayActive : false,
+        configExists: !!statOrNull(this.info.configPath),
+        payloadAvailable: !!statOrNull(this.payloadDll) || relayExists,
+        needsRestart: relayExists && !relayActive,
+        dllSha256: relayExists ? sha256OrUndefined(this.info.dllPath) : undefined,
+      };
+    }
     const dllExists = !!statOrNull(this.info.dllPath);
     const dllLoaded = dllExists ? isDllLoadedInThisProcess(this.info.dllPath) : false;
     return {
@@ -115,6 +143,40 @@ class PatchGuard {
     /** @type {string[]} */
     const restored = [];
     try {
+      if (this.isMacos) {
+        fs.mkdirSync(this.info.installDir, { recursive: true });
+        if (!statOrNull(this.info.dllPath) && statOrNull(this.payloadDll)) {
+          fs.mkdirSync(path.dirname(this.info.dllPath), { recursive: true });
+          atomicCopy(this.payloadDll, this.info.dllPath, this.t);
+          try { fs.chmodSync(this.info.dllPath, 0o755); } catch { /* ignore */ }
+          restored.push("agp-relay.js");
+        }
+        if (!statOrNull(this.info.configPath)) {
+          const lastGood = this.store.loadLastGood();
+          if (lastGood) {
+            const tmp = `${this.info.configPath}.agp-${process.pid}-${Date.now()}.tmp`;
+            fs.writeFileSync(tmp, JSON.stringify(lastGood, null, 2) + "\n", "utf8");
+            fs.renameSync(tmp, this.info.configPath);
+            restored.push(this.t("ext.restoredConfigLastGood"));
+          } else if (statOrNull(this.payloadConfig)) {
+            atomicCopy(this.payloadConfig, this.info.configPath, this.t);
+            restored.push(this.t("ext.restoredConfigDefault"));
+          } else {
+            const tmp = `${this.info.configPath}.agp-${process.pid}-${Date.now()}.tmp`;
+            fs.writeFileSync(tmp, JSON.stringify(Core.defaultForm(), null, 2) + "\n", "utf8");
+            fs.renameSync(tmp, this.info.configPath);
+            restored.push(this.t("ext.restoredConfigDefault"));
+          }
+        }
+        if (this.shouldRestoreAcpWrapper() && !statOrNull(this.acpWrapperPath) && statOrNull(this.payloadAcpWrapper)) {
+          fs.mkdirSync(path.dirname(this.acpWrapperPath), { recursive: true });
+          atomicCopy(this.payloadAcpWrapper, this.acpWrapperPath, this.t);
+          try { fs.chmodSync(this.acpWrapperPath, 0o755); } catch { /* ignore */ }
+          restored.push(this.acpWrapperName);
+        }
+        return { ok: true, restored };
+      }
+
       if (!statOrNull(this.info.dllPath)) {
         if (!statOrNull(this.payloadDll)) {
           return { ok: false, restored, error: this.t("guard.noPayload") };
@@ -138,7 +200,7 @@ class PatchGuard {
       // 只恢复用户曾部署过的 ACP 包装器：其它编辑器的 Agent 配置指向这个路径，缺失会导致 Agent 无法启动
       if (this.shouldRestoreAcpWrapper() && !statOrNull(this.acpWrapperPath) && statOrNull(this.payloadAcpWrapper)) {
         atomicCopy(this.payloadAcpWrapper, this.acpWrapperPath, this.t);
-        restored.push(ACP_WRAPPER_NAME);
+        restored.push(this.acpWrapperName);
       }
       return { ok: true, restored };
     } catch (e) {

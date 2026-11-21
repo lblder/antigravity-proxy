@@ -74,6 +74,7 @@ class ConfigStore {
     const text = JSON.stringify(obj, null, 2) + "\n";
     let backupPath;
     try {
+      fs.mkdirSync(path.dirname(this.configPath), { recursive: true });
       backupPath = this.backupCurrent();
       const tmp = `${this.configPath}.agp-${process.pid}-${Date.now()}.tmp`;
       fs.writeFileSync(tmp, text, "utf8");
@@ -98,7 +99,11 @@ class ConfigStore {
     if (!fs.existsSync(this.configPath)) return undefined;
     fs.mkdirSync(this.backupDir, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const dst = path.join(this.backupDir, `config-${stamp}.json`);
+    let dst = path.join(this.backupDir, `config-${stamp}.json`);
+    // 高速磁盘同一毫秒内连续保存时避免覆盖前一份备份
+    for (let seq = 1; fs.existsSync(dst); seq++) {
+      dst = path.join(this.backupDir, `config-${stamp}-${String(seq).padStart(2, "0")}.json`);
+    }
     fs.copyFileSync(this.configPath, dst);
     this.pruneBackups();
     return dst;

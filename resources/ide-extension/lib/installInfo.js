@@ -10,41 +10,118 @@
  */
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 
 /** 可能的主程序名（Antigravity IDE 为主，保留常见 VS Code 系兼容） */
 const KNOWN_EXE_NAMES = ["Antigravity IDE.exe", "Antigravity.exe", "Code.exe"];
 
 /**
+ * @typedef {"win-dll" | "macos-relay" | "unsupported"} PlatformMode
  * @typedef {Object} InstallInfo
- * @property {boolean} supported   当前平台是否支持（仅 Windows：补丁为 version.dll 劫持）
- * @property {string} installDir   安装目录（与主程序同级）
- * @property {string} exePath      主程序完整路径（用于重启）
- * @property {string} dllPath      version.dll 路径
- * @property {string} configPath   config.json 路径
- * @property {string} logsDir      DLL 日志目录
+ * @property {boolean} supported        当前平台是否支持（Windows=version.dll；macOS=本地微中继）
+ * @property {PlatformMode} mode        当前平台代理模式
+ * @property {string} installDir        Windows=安装目录；macOS=~/.antigravity-proxy
+ * @property {string} exePath           主程序或独立代理启动器完整路径（用于重启）
+ * @property {string} dllPath           Windows=version.dll；macOS=relay/agp-relay.js
+ * @property {string} configPath        config.json 路径
+ * @property {string} logsDir           日志目录（proxy-YYYYMMDD.log）
+ * @property {string} [relayStatePath]  macOS 本地微中继状态文件（relay.json）
  */
+
+/**
+ * 解析 macOS 侧的代理目录与独立启动器路径（绝不写入已签名的 /Applications/Antigravity.app 内部）。
+ * @param {string} appRoot
+ * @param {{ homeDir?: string, env?: NodeJS.ProcessEnv, fsImpl?: typeof fs }} [opts]
+ * @returns {InstallInfo}
+ */
+function resolveMacosInstallInfo(appRoot, opts = {}) {
+  const homeDir = opts.homeDir || os.homedir();
+  const env = opts.env || process.env;
+  const fsImpl = opts.fsImpl || fs;
+  const agpHome = env.AGP_HOME || path.join(homeDir, ".antigravity-proxy");
+  const configPath = env.AGP_CONFIG_PATH || path.join(agpHome, "config.json");
+  const relayStatePath = env.AGP_RELAY_STATE || path.join(agpHome, "relay.json");
+
+  const launcherCandidates = [
+    env.AGP_PROXY_APP || path.join(homeDir, "Applications", "Antigravity (Proxy).app"),
+    path.join(agpHome, "scripts", "antigravity-launcher.sh"),
+    "/Applications/Antigravity IDE.app",
+    "/Applications/Antigravity.app",
+  ];
+  const exePath = launcherCandidates.find((p) => {
+    try { return fsImpl.existsSync(p); } catch { return false; }
+  }) || appRoot || process.execPath;
+
+  return {
+    supported: true,
+    mode: "macos-relay",
+    installDir: agpHome,
+    exePath,
+    dllPath: path.join(agpHome, "relay", "agp-relay.js"),
+    configPath,
+    logsDir: path.join(agpHome, "logs"),
+    relayStatePath,
+  };
+}
 
 /**
  * 由 appRoot 推导安装目录，并探测主程序路径。
  * @param {string} appRoot vscode.env.appRoot
+ * @param {{ platform?: NodeJS.Platform, homeDir?: string, env?: NodeJS.ProcessEnv, fsImpl?: typeof fs }} [opts]
  * @returns {InstallInfo}
  */
-function resolveInstallInfo(appRoot) {
+function resolveInstallInfo(appRoot, opts = {}) {
+  const platform = opts.platform || process.platform;
+  if (platform === "darwin") {
+    return resolveMacosInstallInfo(appRoot, opts);
+  }
+  const fsImpl = opts.fsImpl || fs;
   const installDir = path.resolve(appRoot, "..", "..");
-  let exePath = KNOWN_EXE_NAMES.map((n) => path.join(installDir, n)).find((p) => fs.existsSync(p)) || "";
+  let exePath = KNOWN_EXE_NAMES.map((n) => path.join(installDir, n)).find((p) => fsImpl.existsSync(p)) || "";
   if (!exePath) {
     // 兜底：扩展宿主由主程序以 utility 进程方式拉起，execPath 即主程序
     exePath = process.execPath;
   }
   return {
-    supported: process.platform === "win32",
+    supported: platform === "win32",
+    mode: platform === "win32" ? "win-dll" : "unsupported",
     installDir,
     exePath,
     dllPath: path.join(installDir, "version.dll"),
     configPath: path.join(installDir, "config.json"),
     logsDir: path.join(installDir, "logs"),
   };
+}
+
+/**
+ * 检测当前 macOS IDE 进程是否通过 Antigravity-Proxy 本地微中继启动。
+ * 兼容两类证据：
+ * 1) 启动器显式注入的 AGP_MACOS_RELAY_URL；
+ * 2) 部分子进程会过滤自定义 AGP_* 变量但保留标准代理变量：此时比对 HTTPS_PROXY / HTTP_PROXY
+ *    是否匹配 relay.json 中正在监听的 http://<host>:<port>。
+ * @param {NodeJS.ProcessEnv} [env]
+ * @param {string} [relayStatePath]
+ * @param {typeof fs} [fsImpl]
+ * @returns {boolean}
+ */
+function isMacosRelayActive(env = process.env, relayStatePath = "", fsImpl = fs) {
+  const marker = String(env.AGP_MACOS_RELAY_URL || "").trim();
+  if (/^http:\/\/127\.0\.0\.1:\d+/.test(marker)) return true;
+
+  if (relayStatePath) {
+    try {
+      const state = JSON.parse(fsImpl.readFileSync(relayStatePath, "utf8"));
+      if (state && Number(state.port) > 0) {
+        const expected = `http://${state.host || "127.0.0.1"}:${state.port}`;
+        const candidates = [env.HTTPS_PROXY, env.https_proxy, env.HTTP_PROXY, env.http_proxy, env.ALL_PROXY, env.all_proxy];
+        if (candidates.some((v) => String(v || "").trim().replace(/\/+$/, "") === expected)) {
+          return true;
+        }
+      }
+    } catch { /* relay.json 不存在或不可读 */ }
+  }
+  return false;
 }
 
 /**
@@ -100,4 +177,4 @@ function statOrNull(filePath) {
   }
 }
 
-module.exports = { resolveInstallInfo, isDllLoadedInThisProcess, statOrNull, KNOWN_EXE_NAMES };
+module.exports = { resolveInstallInfo, resolveMacosInstallInfo, isDllLoadedInThisProcess, isMacosRelayActive, statOrNull, KNOWN_EXE_NAMES };

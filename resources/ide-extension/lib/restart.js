@@ -121,6 +121,31 @@ function runLauncher(script, timeoutMs = 15000) {
   });
 }
 
+/** POSIX shell 单引号安全转义 */
+const shQuote = (/** @type {string} */ s) => `'${String(s).replace(/'/g, "'\\''")}'`;
+
+/**
+ * macOS 重启脚本：等待当前 IDE 主进程退出后，通过独立启动器（.app 或 launcher.sh）重新拉起。
+ * @param {number} mainPid
+ * @param {string} targetPath
+ * @param {number} [waitSeconds]
+ */
+function buildMacosRelaunchScript(mainPid, targetPath, waitSeconds = 90) {
+  const pid = Number(mainPid) | 0;
+  const maxTicks = Math.max(1, Math.floor((waitSeconds * 1000) / 300));
+  const launchCmd = /\.app$/i.test(targetPath)
+    ? `open -na ${shQuote(targetPath)}`
+    : `${shQuote(targetPath)} >/dev/null 2>&1 &`;
+  return [
+    `MAIN_PID=${pid}`,
+    `TICKS=${maxTicks}`,
+    "while kill -0 \"$MAIN_PID\" 2>/dev/null && [ \"$TICKS\" -gt 0 ]; do sleep 0.3; TICKS=$((TICKS - 1)); done",
+    "if kill -0 \"$MAIN_PID\" 2>/dev/null; then exit 0; fi",
+    "sleep 0.5",
+    launchCmd,
+  ].join("\n");
+}
+
 /**
  * 拉起重启器并退出 IDE。
  * @param {typeof import("vscode")} vscode
@@ -129,6 +154,21 @@ function runLauncher(script, timeoutMs = 15000) {
  */
 async function restartIde(vscode, exePath, t) {
   const mainPid = process.ppid;
+  if (process.platform === "darwin") {
+    try {
+      const child = spawn("/bin/sh", ["-c", buildMacosRelaunchScript(mainPid, exePath)], {
+        detached: true,
+        stdio: "ignore",
+        env: sanitizeEnv(process.env),
+      });
+      child.unref();
+    } catch {
+      void vscode.window.showErrorMessage(t("ext.restartHelperFailed"));
+      return;
+    }
+    await vscode.commands.executeCommand("workbench.action.quit");
+    return;
+  }
   const ok = await runLauncher(buildLauncherScript(mainPid, buildRelauncherScript(mainPid, exePath)));
   if (!ok) {
     // 重启器未能启动时不退出 IDE，避免用户“只关不开”
@@ -138,4 +178,4 @@ async function restartIde(vscode, exePath, t) {
   await vscode.commands.executeCommand("workbench.action.quit");
 }
 
-module.exports = { restartIde, buildRelauncherScript, buildLauncherScript, runLauncher, sanitizeEnv, ARGS_ENV };
+module.exports = { restartIde, buildRelauncherScript, buildLauncherScript, buildMacosRelaunchScript, runLauncher, sanitizeEnv, ARGS_ENV };
